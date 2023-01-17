@@ -1,10 +1,17 @@
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.124/build/three.module.js'; 
+
+import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.124/examples/jsm/controls/OrbitControls.js'; 
+import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.124/examples/jsm/loaders/GLTFLoader.js'; 
+
+//import {loadGLTF} from './blenderImport.js'
+
 // Declare renderer, camera and create scene
 const renderer = new THREE.WebGLRenderer()
 renderer.shadowMap.enabled = true
 renderer.shadowMap.type = THREE.PCFSoftShadowMap
 const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.3, 10000) // FOV, window ratio, near, far
 const scene = new THREE.Scene()
-const controls = new THREE.OrbitControls(camera, renderer.domElement) // create orbit controls
+const controls = new OrbitControls(camera, renderer.domElement) // create orbit controls
 let poolTable
 let poolCue
 let billiardRoom
@@ -21,6 +28,8 @@ const motionOfInertia = 5 / 7
 // Billiard table inner size
 const width = 2.24 * 2
 const height = 1.12 * 2
+
+const h = 1 / 60
 
 // User player variables
 const maxPower = 200
@@ -165,8 +174,275 @@ let Force = 200 * 0
 let Force_temp = 100
 let firstBall = true
 
+// Load billiard table from blender file
+function loadGLTF() {
+  const tableLoader = new GLTFLoader()
+  // Load table
+  tableLoader.load('./assets/pooltable.gltf', (gltf) => {
+      poolTable = gltf.scene
+      scene.add(poolTable)
+      poolTable.castShadow = true
+      poolTable.receiveShadow = true
+      poolTable.position.set(0.01   , -radius, width / 2) // Position the table correctly and rotate
+  })
+
+  // Load cue
+  const cueLoader = new GLTFLoader()
+  cueLoader.load('./assets/poolcue.gltf', (gltf) => {
+      poolCue = gltf.scene
+      scene.add(poolCue)
+      poolCue.castShadow = true
+      poolCue.receiveShadow = true
+      poolCue.position.set(0, 0, 0) // Position pool cue
+      poolCue.rotation.set(0, 0, 0.2) // Rotate pool cue to look good
+  })
+  
+  // Load room
+  const roomLoader = new GLTFLoader()
+  roomLoader.load('./assets/biljardRoom.gltf', (gltf) => {
+      billiardRoom = gltf.scene
+      scene.add(billiardRoom)
+      billiardRoom.castShadow = true
+      billiardRoom.receiveShadow = true
+      billiardRoom.position.set(2, -0.25, 1)
+  })
+
+}
+
 // Load the billiard table
 loadGLTF()
+
+function euler(inV, inP, n) {
+  // Calculate acceleration accordint to ODE v' = (F-F_friction)/m
+  const a = new THREE.Vector2((Force - Friction[n]) * Math.cos(tau[n]) / m, (Force - Friction[n]) * Math.sin(tau[n]) / m)
+
+  // Iterate next velocity according to Euler's method
+  const outV = new THREE.Vector2()
+  outV.x = inV.x + a.x * h
+  outV.y = inV.y + a.y * h
+
+  // Iterate next position according to Euler's method
+  const outP = new THREE.Vector2()
+  outP.x = inP.x + outV.x * h
+  outP.y = inP.y + outV.y * h
+
+  // Test if ball should stop, then remove friction and set velocity to 0
+  if (outV.x * Math.cos(tau[n]) < 0) {
+      Friction[n] = 0
+      outV.x = 0
+      outV.y = 0
+  }
+
+  if (inV.length() == 0) {
+      initialVelocity[n] = outV.length()
+  }
+
+  Force = 0 // Only force pushing the ball in the first frame, @TODO find a better solution?
+  return [outV, outP]
+}
+
+let counter = 0 // Counter to place the balls
+let rowCounter = 0
+
+// Detect if the ball is colliding with a wall or goes into a hole
+// Then it mirrors the velocity in that axis, or teleport the ball to the side
+// @param inP is the current position, prevPos is the position from last iteration, inV is the current velocity, n is the slot in the spheres array
+// @return outV is the velocity after edge collision, or the same, outP is the position after edge collision
+function edgeDetection(inP, prevPos, inV, n) {
+    // Non elastic collision
+    const elast = 0.5
+    let out
+
+    // Declare out variables
+    let outV = new THREE.Vector2()
+    let outP = new THREE.Vector2()
+
+    // Test if ball goes in hole, then teleport en remove velocity
+    if (inP.distanceTo(new THREE.Vector2(0, -2 * radius)) <= 2.9 * radius || (inP.distanceTo(new THREE.Vector2(width + 2 * radius, -2 * radius)) <= 2.9 * radius ||
+        (inP.distanceTo(new THREE.Vector2(width + 2 * radius, height)) <= 2.9 * radius)) || (inP.distanceTo(new THREE.Vector2(0, height)) <= 2.9 * radius) ||
+        (inP.distanceTo(new THREE.Vector2(width / 2 + radius, -2 * radius)) <= 3.5 * radius / 2) || (inP.distanceTo(new THREE.Vector2(width / 2 + radius, height)) <= 3.5 * radius / 2)) {
+        if (n == 0) {
+            // If white ball goes in, do something different
+            outP = new THREE.Vector2(width / 6, height / 2)
+            out = new THREE.Vector2(0, 0)
+            Friction[n] = 0
+        }
+        else {
+            // Regular ball goes into hole
+            outP = new THREE.Vector2(5 + rowCounter, counter + 0.5)
+            out = new THREE.Vector2(0, 0)
+            Friction[n] = 0
+            counter += 2.5 * radius
+            spheres[n].rotation.set(0, 0, 1 * Math.PI / 3)
+
+            if (counter / (2.5 * radius) > 8) {
+                rowCounter = 2.5 * radius
+                counter = 0
+            }
+
+
+        }
+    }
+    // Ball collides with top or bottom
+    else if ((inP.y >= height - radius || inP.y <= -radius) && (inP.x < width / 2 + radius - 3.5 * radius / 2 || inP.x > width / 2 + radius + 3.5 * radius / 2)) {
+        outV = new THREE.Vector2(elast * inV.x, -elast * inV.y)
+        outP = prevPos
+        tau[n] = -tau[n] // See note for proof
+
+    }
+    // Ball collides left or right
+    else if (inP.x >= width + radius || inP.x <= radius) {
+        outV = new THREE.Vector2(-elast * inV.x, elast * inV.y)
+        outP = prevPos
+        tau[n] = Math.PI - tau[n] // See note for proof
+
+    }
+    // Do nothing
+    else {
+        outV = inV
+        outP = inP
+    }
+
+    return [outV, outP]
+}
+
+
+// Two balls collide with each other
+// @param v1 and v2 are current velocity of the balls, p1 and p2 are current positions of the balls, prevPos1-2 are positions of the two balls from last iteration, n and k are the slots in the spheres array
+// @return outV1 and outV2 are the velocity after collision, outP1 and outP2 are the positions after collision
+function ballCollision(v1, v2, p1, p2, prevPos1, prevPos2, n, k) {
+    // Non elastic collision
+    const elast = 0.95
+
+    // Return variables
+    let outV1 = new THREE.Vector2()
+    let outV2 = new THREE.Vector2()
+    let outPos1 = new THREE.Vector2()
+    let outPos2 = new THREE.Vector2()
+    let vDiff1 = new THREE.Vector2()
+    let vDiff2 = new THREE.Vector2()
+    let pDiff1 = new THREE.Vector2()
+    let pDiff2 = new THREE.Vector2()
+
+    // To not change data of inputs create copies since vectors are objects => passed by reference
+    let v1Copy = v1.clone()
+    let v2Copy = v2.clone()
+    let p1Copy = p1.clone()
+    let p2Copy = p2.clone()
+
+    // Test if distance between balls are less than 2 radius
+    if (p1Copy.distanceTo(p2Copy) < 2 * radius) {
+        // To make code more readable create difference variables
+        vDiff1.subVectors(v1Copy, v2Copy)
+        pDiff1.subVectors(p1Copy, p2Copy)
+        vDiff2.subVectors(v2Copy, v1Copy)
+        pDiff2.subVectors(p2Copy, p1Copy)
+
+        // Calculate new velocity vectors and correct tau for the new velocity
+        outV1.subVectors(v1Copy, pDiff1.multiplyScalar(vDiff1.dot(pDiff1)).divideScalar(p1Copy.distanceToSquared(p2Copy))).multiplyScalar(elast)
+        outPos1 = prevPos1
+        tau[n] = outV1.angle()
+
+        outV2.subVectors(v2Copy, pDiff2.multiplyScalar(vDiff2.dot(pDiff2)).divideScalar(p2Copy.distanceToSquared(p1Copy))).multiplyScalar(elast)
+        outPos2 = prevPos2
+        tau[k] = outV2.angle()
+
+        // Test if one of the balls were still, then store initial velocity to later decide rolling or sliding
+        if (v1.length() == 0) {
+            Friction[n] = m * g * my
+            initialVelocity[n] = outV1.length()
+        }
+        else if (v2.length() == 0) {
+            Friction[k] = m * g * my
+            initialVelocity[k] = outV2.length()
+        }
+    }
+    // Do nothing
+    else {
+        outV1 = v1Copy
+        outV2 = v2Copy
+        outPos1 = p1Copy
+        outPos2 = p2Copy
+    }
+
+    return [outV1, outV2, outPos1, outPos2]
+}
+
+// Function to handle user inputs to play the game
+// @param i is current ball to make sure you play with the white ball
+function userInputs(i) {
+  // Key handler
+  document.onkeydown = function (e) {
+      if (e.keyCode === 67) {
+          // C key
+          controls.reset()
+      }
+
+      if (e.keyCode === 82) {
+          // R key
+          for (let k = 0; k < spheres.length; ++k) {
+              p[k] = standPosition[k]
+              v[k].x = 0
+              v[k].y = 0
+              Friction[k] = 0
+          }
+          tau[0] = 0
+          counter = 0
+          rowCounter = 0
+      }
+
+      if (e.keyCode === 39 && v.reduce((partialSum, a) => partialSum + a.length(), 0) == 0 && i == spheres.length - 1) {
+          // right arrow
+          tau[0] += angleChange
+      } else if (e.keyCode === 37 && v.reduce((partialSum, a) => partialSum + a.length(), 0) == 0 && i == spheres.length - 1) {
+          // left arrow
+          tau[0] -= angleChange
+      } else if (e.keyCode === 32 && v.reduce((partialSum, a) => partialSum + a.length(), 0) == 0 && i == spheres.length - 1) {
+          // Space
+          Force = Force_temp
+          poolCue.visible = false
+      } else if (e.keyCode === 38 && v.reduce((partialSum, a) => partialSum + a.length(), 0) == 0 && i == spheres.length - 1) {
+          // Up arrow
+          Force_temp += forceChange
+          Force_temp = Math.min(Force_temp, maxPower)
+          document.getElementById('powerbar').children[0].style.width = Force_temp / maxPower * 100 + '%'
+      }
+      else if (e.keyCode === 40 && v.reduce((partialSum, a) => partialSum + a.length(), 0) == 0 && i == spheres.length - 1) {
+          // Down arrow
+          Force_temp -= forceChange
+          Force_temp = Math.max(Force_temp, minPower)
+          document.getElementById('powerbar').children[0].style.width = Force_temp / maxPower * 100 + '%'
+      }
+  }
+}
+
+let rotWorldMatrix
+// Rotate an object around an arbitrary axis in world space       
+function rotateAroundWorldAxis(object, axis, radians) {
+    rotWorldMatrix = new THREE.Matrix4()
+    rotWorldMatrix.makeRotationAxis(axis.normalize(), radians)
+
+    // old code for Three.JS pre r54:
+    //  rotWorldMatrix.multiply(object.matrix);
+    // new code for Three.JS r55+:
+    rotWorldMatrix.multiply(object.matrix);               // pre-multiply
+
+    object.matrix = rotWorldMatrix
+
+    // old code for Three.js pre r49:
+    // object.rotation.getRotationFromMatrix(object.matrix, object.scale);
+    // old code for Three.js pre r59:
+    // object.rotation.setEulerFromRotationMatrix(object.matrix);
+    // code for r59+:
+    object.rotation.setFromRotationMatrix(object.matrix)
+}
+// Code from https://stackoverflow.com/questions/11060734/how-to-rotate-a-3d-object-on-axis-three-js
+
+
+// To get a random number between min and max (int)
+function randomNum(min, max) {
+    return Math.floor(Math.random() * (max - min)) + min
+}
 
 // The render loop
 function render() {
@@ -187,7 +463,7 @@ function render() {
 
     // Ball collision
     for (let j = i + 1; j < spheres.length; ++j) {
-      ballOut = ballCollision(v[i], v[j], p[i], p[j], prevPosition[i], prevPosition[j], i, j)
+      let ballOut = ballCollision(v[i], v[j], p[i], p[j], prevPosition[i], prevPosition[j], i, j)
       v[i] = ballOut[0]
       v[j] = ballOut[1]
       p[i] = ballOut[2]
@@ -238,7 +514,35 @@ function animate() {
   }, 20)
 }
 
-// Call needed functions
+// Set up camera and background of the scene
+function init() {
+  scene.background = new THREE.Color('pink')
+
+  camera.position.set(width / 2, 2, height / 2) // Place camera in the middle of the table and 2 units above
+  controls.target = new THREE.Vector3(width / 2, 0, height / 2) // Point camera at center of table
+  controls.enablePan = false // false removes ability to pan the camera
+  controls.maxDistance = 4.5 // max zoom out, inf is max
+  controls.minDistance = 3 // max zoom in, 0 is min
+  controls.maxPolarAngle = Math.PI / 2.3 // max angle rotation
+  controls.saveState() // save position to be able to get here later
+
+  renderer.setSize(window.innerWidth, window.innerHeight)
+  document.body.appendChild(renderer.domElement)
+}
+
+
+// Set up ambient and a point light to the scene
+function setLight() {
+  const light = new THREE.AmbientLight(0xffffff, 0.2) // soft white light; color, intensity
+  scene.add(light)
+  const pointLight = new THREE.PointLight(0xffffff, 1, 0) // Color, near, far
+  pointLight.position.set(width / 2, 3, height / 2) // Position the point light
+  pointLight.shadow.mapSize.width = 1024 // Shadow quality
+  pointLight.shadow.mapSize.height = 1024
+  pointLight.castShadow = true
+  scene.add(pointLight)
+}
+
 init()
 setLight()
 animate()
